@@ -1,0 +1,24 @@
+<active_glossary_and_voices>
+{{ active_entities_json }}
+</active_glossary_and_voices>
+
+<context_prev_translations>
+<!-- 前两段已定稿译文，请确保本段起首的句式节奏、主语省略和文气与之自然贯通 -->
+{{ prev_translations }}
+</context_prev_translations>
+
+<current_source_segment>
+{{ current_source }}
+</current_source_segment>
+
+<pass1_linguistic_draft>
+【语法与潜台词解析】：{{ pass1_notes }}
+【直译底稿】：{{ pass1_draft }}
+</pass1_linguistic_draft>
+{% if retry_feedback %}
+<qa_feedback_for_retry>
+⚠️ 注意：你上一版的译文未通过质检门禁，请务必针对以下审校意见进行修正：
+- 上一版译文：{{ previous_failed_translation }}
+- 质检驳回原因：{{ retry_feedback }}
+</qa_feedback_for_retry>
+{% endif %}

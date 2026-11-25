@@ -1,0 +1,45 @@
+<book_metadata>
+书名：{{ book_title }}
+作者：{{ author }}
+源语言：{{ source_lang }}
+</book_metadata>
+
+<full_manuscript>
+{{ full_book_text }}
+</full_manuscript>
+
+请深度扫描上述全书手稿，输出符合以下结构的《翻译圣经》JSON：
+{
+  "global_style_guide": {
+    "narrative_tone": "全书整体叙事基调描述（如：福楼拜式的零度叙事、冷峻克制、暗藏不动声色的反讽）",
+    "free_indirect_discourse_rule": "自由间接引语（Style indirect libre）的处理准则，如何区分叙述者声音与人物内心独白",
+    "syntax_strategy": "长难句拆解与节奏控制指南（如：如何处理法语高频分词构句、关系从句嵌套与三叠排比节奏）",
+    "honorifics_rules": "法语称谓（M., Mme, Mlle 等）在不同阶层/场景下的具体译法映射规则"
+  },
+  "core_characters": [
+    {
+      "canonical_id": "char_001",
+      "source_name": "Frédéric Moreau",
+      "aliases": ["Frédéric", "Moreau", "M. Moreau"],
+      "target_name": "弗雷德里克·莫罗",
+      "short_target_map": {"Frédéric": "弗雷德里克", "Moreau": "莫罗"},
+      "forbidden_variants": ["弗雷德里克·莫洛", "腓特烈", "莫劳"],
+      "identity_and_arc": "人物身份与全书轨迹简述（50字内）",
+      "voice_profile": "说话语气、用词阶层特征、性格底色",
+      "pronoun_matrix": [
+        {"target_character": "Deslauriers", "pronoun": "你（老友亲昵）"},
+        {"target_character": "Mme Arnoux", "pronoun": "您（仰慕与克制，需据原文 tu/vous 严格对应）"}
+      ]
+    }
+  ],
+  "glossary": [
+    {
+      "source_term": "原文专有名词（地名/机构/历史事件/报刊/器物）",
+      "aliases": ["常见拼写或简称变体"],
+      "target_term": "标准中文译名",
+      "forbidden_variants": ["易错音译变体"],
+      "category": "LOCATION | INSTITUTION | HISTORICAL_TERM | WORK_OF_ART | OTHER",
+      "context_note": "必要时的背景说明或一词多义区分提示"
+    }
+  ]
+}

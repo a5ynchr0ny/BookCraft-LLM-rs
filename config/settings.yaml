@@ -1,0 +1,103 @@
+# BookCraft-LLM 运行配置
+#
+# 模型路由说明：
+#   bible  : Step 1 全书扫描，生成《翻译圣经》（需要超长上下文）
+#   pass1  : Step 2a 语义锚定 / 直译（忠实优先，低温）
+#   pass2  : Step 2b 文学重塑 / 去翻译腔（高温，静态前缀可命中 Prompt Caching）
+#   judge  : Step 3 LLM-as-a-Judge 盲审（轻量、便宜、低温）
+# 模型名仅作默认值，可按实际账号可用模型替换；provider 必须存在于 providers 下。
+
+book:
+  source_lang: fr
+  target_lang: zh
+  # 留空则从 EPUB 元数据读取
+  title: ""
+  author: ""
+
+paths:
+  # 相对路径基于仓库根目录；内含 state.db / templates / output
+  workdir: work
+
+concurrency:
+  # 章间并发；章内严格顺序滑动，保证前文译文可用
+  chapter_workers: 8
+  # 始终挂载的核心角色数量（按全书提及频次排序）
+  core_characters: 10
+  # 全书扫描的输入预算（字符），超出后按章均匀抽样，避免请求体爆炸
+  bible_max_input_chars: 1200000
+
+qa:
+  # 初次生成之外最多再重试的次数
+  max_retry: 2
+  # Judge 放行阈值：score >= 4 且无硬伤
+  judge_pass_score: 4
+  # 法译中经验区间：译文汉字数 / 原文词数
+  length_ratio:
+    min: 1.1
+    max: 2.4
+    dialogue_min: 0.7
+    dialogue_max: 3.5
+
+models:
+  bible:
+    provider: gemini
+    model: gemini-3-pro
+    temperature: 0.2
+    max_output_tokens: 32768
+  pass1:
+    provider: deepseek
+    model: deepseek-v4
+    temperature: 0.1
+    max_output_tokens: 8192
+  pass2:
+    provider: anthropic
+    model: claude-sonnet-4-5
+    temperature: 0.7
+    max_output_tokens: 8192
+  judge:
+    provider: openai
+    model: gpt-4o-mini
+    temperature: 0.0
+    max_output_tokens: 4096
+
+providers:
+  gemini:
+    type: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key_env: GEMINI_API_KEY
+    timeout_seconds: 300
+  deepseek:
+    type: openai
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 180
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    api_version: "2023-06-01"
+    timeout_seconds: 180
+  openai:
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    timeout_seconds: 120
+  # bookcraft --mock 时所有路由指向该 provider，用于无密钥跑通全链路
+  mock:
+    type: mock
+
+# 单价 USD / 百万 token，用于成本台账；用 provider/model 作为键
+pricing:
+  deepseek/deepseek-v4:
+    input_per_mtok: 0.28
+    output_per_mtok: 0.42
+  anthropic/claude-sonnet-4-5:
+    input_per_mtok: 3.0
+    output_per_mtok: 15.0
+    cached_input_per_mtok: 0.3
+  openai/gpt-4o-mini:
+    input_per_mtok: 0.15
+    output_per_mtok: 0.6
+  gemini/gemini-3-pro:
+    input_per_mtok: 1.25
+    output_per_mtok: 10.0

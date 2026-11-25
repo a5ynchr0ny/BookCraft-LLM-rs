@@ -1,0 +1,11 @@
+/target/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# 运行时产物：状态库、模板、导出书
+work/
+*.db
+*.db-wal
+*.db-shm
