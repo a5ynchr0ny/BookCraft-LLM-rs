@@ -12,7 +12,7 @@ use roxmltree::Document as XmlDocument;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
-use crate::epub_io::read_document;
+use crate::epub_io::{read_document, resolve_href};
 use crate::html::{
     children, element_name, find_elements, inner_html, is_block_tag, is_skip_tag, is_void_tag,
     normalize_whitespace, opening_tag, parse_document_html, remove_children, serialize_document,
@@ -362,34 +362,6 @@ fn node_text(node: &roxmltree::Node<'_, '_>) -> String {
         .collect::<String>()
         .trim()
         .to_string()
-}
-
-fn resolve_href(base_dir: &str, href: &str) -> String {
-    let decoded = percent_decode_str(href)
-        .decode_utf8_lossy()
-        .replace('\\', "/");
-    let path = decoded.split('#').next().unwrap_or("");
-    if path.is_empty() {
-        return String::new();
-    }
-    let combined = if path.starts_with('/') {
-        path.trim_start_matches('/').to_string()
-    } else if base_dir.is_empty() {
-        path.to_string()
-    } else {
-        format!("{base_dir}/{path}")
-    };
-    let mut parts: Vec<&str> = Vec::new();
-    for part in combined.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
 }
 
 // ---------------------------------------------------------------------------

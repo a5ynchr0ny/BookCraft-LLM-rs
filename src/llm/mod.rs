@@ -1,8 +1,15 @@
 //! 多模型 LLM 客户端：OpenAI 兼容 / Anthropic / Gemini / Mock。
+//!
+//! 运行保护：
+//! * 欠费/额度耗尽（HTTP 402 或余额类错误标记）抛 `BillingError`，不可重试；
+//! * provider 级连续失败熔断，同 `breaker_group` 共享冷却状态；
+//! * 429/503/529 反馈给 `AdaptiveSemaphore`，动态下调章节并发；
+//! * 长跑前可选余额预检（`providers.*.balance_url`）。
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -11,13 +18,26 @@ use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+use crate::concurrency::AdaptiveSemaphore;
 use crate::config::{ProviderConfig, RouteConfig, RouteName, Settings};
 use crate::models::Validate;
 use crate::state::StateStore;
 
 const RETRYABLE_STATUS: &[u16] = &[408, 409, 425, 429, 500, 502, 503, 504, 529];
+const NORMAL_ATTEMPTS: u32 = 6;
+const BILLING_MARKERS: &[&str] = &[
+    "insufficient balance",
+    "insufficient_quota",
+    "quota exceeded",
+    "quota_exhausted",
+    "billing_hard_limit",
+    "余额不足",
+    "欠费",
+    "额度已用尽",
+    "额度不足",
+];
 static FENCE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```(?:json)?\s*(.*?)```").unwrap());
 static TAG_INNER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^/?tag_\d+/?$").unwrap());
@@ -45,6 +65,137 @@ pub struct CompletionRequest {
 #[async_trait]
 pub trait Completer: Send + Sync {
     async fn complete(&self, request: &CompletionRequest) -> Result<LlmResponse>;
+}
+
+/// 欠费/额度耗尽：不可重试，应停止整轮翻译并保留检查点。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct BillingError(pub String);
+
+pub fn is_billing_response(status: u16, body: &str) -> bool {
+    if status == 402 {
+        return true;
+    }
+    let lower = body.to_lowercase();
+    BILLING_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+pub fn error_is_billing(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<BillingError>().is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Breaker + runtime
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct BreakerState {
+    consecutive_failures: u32,
+    cooldown_until: Option<Instant>,
+    cooldown_logged: bool,
+}
+
+#[derive(Clone)]
+struct ProviderRuntime {
+    name: String,
+    cfg: ProviderConfig,
+    breaker: Arc<Mutex<BreakerState>>,
+    governor: Arc<AdaptiveSemaphore>,
+}
+
+impl ProviderRuntime {
+    fn lock_breaker(&self) -> std::sync::MutexGuard<'_, BreakerState> {
+        self.breaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn note_success(&self) {
+        {
+            let mut state = self.lock_breaker();
+            state.consecutive_failures = 0;
+            state.cooldown_logged = false;
+        }
+        self.governor.on_success();
+    }
+
+    fn note_failure(&self, reason: &str, rate_limit: bool) {
+        if rate_limit {
+            self.governor.on_rate_limit();
+        }
+        let mut state = self.lock_breaker();
+        state.consecutive_failures += 1;
+        let threshold = self.cfg.breaker_failure_threshold.max(1);
+        if state.consecutive_failures >= threshold {
+            state.consecutive_failures = 0;
+            let cooldown = self.cfg.breaker_cooldown_seconds.max(0.0);
+            if cooldown > 0.0 {
+                state.cooldown_until = Some(Instant::now() + Duration::from_secs_f64(cooldown));
+                state.cooldown_logged = false;
+                drop(state);
+                warn!(
+                    "{} 连续失败 {} 次（{}），熔断 {:.0} 秒",
+                    self.name, threshold, reason, cooldown
+                );
+            }
+        }
+    }
+
+    fn start_cooldown(&self) {
+        let cooldown = self.cfg.breaker_cooldown_seconds.max(0.0);
+        if cooldown <= 0.0 {
+            return;
+        }
+        let mut state = self.lock_breaker();
+        let now = Instant::now();
+        let expired = state
+            .cooldown_until
+            .map(|until| now >= until)
+            .unwrap_or(true);
+        if expired {
+            state.cooldown_until = Some(now + Duration::from_secs_f64(cooldown));
+            state.cooldown_logged = false;
+        }
+    }
+
+    fn cooldown_remaining(&self) -> Option<Duration> {
+        let state = self.lock_breaker();
+        let until = state.cooldown_until?;
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn mark_cooldown_logged(&self) {
+        let mut state = self.lock_breaker();
+        state.cooldown_logged = true;
+    }
+
+    fn cooldown_logged(&self) -> bool {
+        self.lock_breaker().cooldown_logged
+    }
+
+    async fn wait_for_cooldown(&self) {
+        loop {
+            let Some(remaining) = self.cooldown_remaining() else {
+                return;
+            };
+            if !self.cooldown_logged() {
+                warn!(
+                    "{} 冷却中，暂停该组所有请求 {:.0} 秒",
+                    self.name,
+                    remaining.as_secs_f64()
+                );
+                self.mark_cooldown_logged();
+            }
+            tokio::time::sleep(remaining.min(Duration::from_secs(5))).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,15 +227,18 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
 }
 
 async fn post_json(
-    provider: &str,
+    runtime: &ProviderRuntime,
     client: &Client,
     url: &str,
     headers: HeaderMap,
     query: &[(String, String)],
     body: &Value,
 ) -> Result<Value> {
-    let mut last_error = String::new();
-    for attempt in 0..4u32 {
+    let max_cooldowns = runtime.cfg.breaker_max_rounds;
+    let mut attempt = 0u32;
+    let mut cooldowns = 0u32;
+    loop {
+        runtime.wait_for_cooldown().await;
         let mut builder = client.post(url).headers(headers.clone()).json(body);
         if !query.is_empty() {
             builder = builder.query(query);
@@ -95,33 +249,84 @@ async fn post_json(
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
                 if status.is_success() {
+                    runtime.note_success();
                     return serde_json::from_str(&text).with_context(|| {
-                        format!("{provider} 返回非 JSON: {}", truncate(&text, 500))
+                        format!("{} 返回非 JSON: {}", runtime.name, truncate(&text, 500))
                     });
                 }
+                if is_billing_response(status.as_u16(), &text) {
+                    return Err(BillingError(format!(
+                        "{} 欠费/额度耗尽（HTTP {}）: {}",
+                        runtime.name,
+                        status.as_u16(),
+                        truncate(&text, 800)
+                    ))
+                    .into());
+                }
                 if RETRYABLE_STATUS.contains(&status.as_u16()) {
+                    runtime.note_failure(
+                        &format!("HTTP {}", status.as_u16()),
+                        matches!(status.as_u16(), 429 | 503 | 529),
+                    );
                     warn!(
-                        "{provider} 返回 {status}（第 {} 次），稍后重试: {}",
+                        "{} 返回 {}（第 {} 次），稍后重试: {}",
+                        runtime.name,
+                        status,
                         attempt + 1,
                         truncate(&text, 300)
                     );
-                    sleep_backoff(attempt).await;
-                    continue;
+                    if attempt + 1 < NORMAL_ATTEMPTS {
+                        attempt += 1;
+                        sleep_backoff(attempt, true).await;
+                        continue;
+                    }
+                    if cooldowns < max_cooldowns {
+                        cooldowns += 1;
+                        runtime.start_cooldown();
+                        attempt = 0;
+                        continue;
+                    }
+                    bail!(
+                        "{} API 错误 {}: {}",
+                        runtime.name,
+                        status.as_u16(),
+                        truncate(&text, 300)
+                    );
                 }
-                bail!("{provider} API 错误 {status}: {}", truncate(&text, 800));
+                bail!(
+                    "{} API 错误 {}: {}",
+                    runtime.name,
+                    status,
+                    truncate(&text, 800)
+                );
             }
             Err(error) => {
-                last_error = error.to_string();
-                warn!("{provider} 网络错误（第 {} 次）: {error}", attempt + 1);
-                sleep_backoff(attempt).await;
+                runtime.note_failure("网络错误", false);
+                warn!(
+                    "{} 网络错误（第 {} 次）: {error}",
+                    runtime.name,
+                    attempt + 1
+                );
+                if attempt + 1 < NORMAL_ATTEMPTS {
+                    attempt += 1;
+                    sleep_backoff(attempt, false).await;
+                    continue;
+                }
+                if cooldowns < max_cooldowns {
+                    cooldowns += 1;
+                    runtime.start_cooldown();
+                    attempt = 0;
+                    continue;
+                }
+                bail!("{} 请求最终失败: {error}", runtime.name);
             }
         }
     }
-    bail!("{provider} 请求最终失败: {last_error}")
 }
 
-async fn sleep_backoff(attempt: u32) {
-    let seconds = (2u64.pow(attempt) * 2).min(30);
+async fn sleep_backoff(attempt: u32, http: bool) {
+    let factor = if http { 2 } else { 1 };
+    let seconds = (2u64.pow(attempt) * factor).min(if http { 30 } else { 15 });
     tokio::time::sleep(Duration::from_secs(seconds)).await;
 }
 
@@ -133,23 +338,30 @@ fn int_at(value: &Value, pointer: &str) -> i64 {
     value.pointer(pointer).and_then(Value::as_i64).unwrap_or(0)
 }
 
+fn merge_extra_body(body: &mut Value, extra: &HashMap<String, Value>) {
+    if extra.is_empty() {
+        return;
+    }
+    if let Some(map) = body.as_object_mut() {
+        for (key, value) in extra {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
 
 pub struct OpenAiCompleter {
-    name: String,
-    cfg: ProviderConfig,
+    runtime: ProviderRuntime,
     client: Client,
 }
 
 impl OpenAiCompleter {
-    fn new(name: &str, cfg: ProviderConfig) -> Result<Self> {
-        Ok(Self {
-            name: name.to_string(),
-            client: build_client(&cfg)?,
-            cfg,
-        })
+    fn new(runtime: ProviderRuntime) -> Result<Self> {
+        let client = build_client(&runtime.cfg)?;
+        Ok(Self { runtime, client })
     }
 }
 
@@ -159,17 +371,17 @@ impl Completer for OpenAiCompleter {
         if request.api_key.is_empty() {
             bail!(
                 "缺少 {} 的 API Key（环境变量 {}）",
-                self.name,
-                self.cfg.api_key_env
+                self.runtime.name,
+                self.runtime.cfg.api_key_env
             );
         }
-        let base = if self.cfg.base_url.is_empty() {
+        let base = if self.runtime.cfg.base_url.is_empty() {
             "https://api.openai.com/v1"
         } else {
-            &self.cfg.base_url
+            self.runtime.cfg.base_url.as_str()
         };
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-        let mut headers = base_headers(&self.cfg);
+        let mut headers = base_headers(&self.runtime.cfg);
         insert_header(
             &mut headers,
             "authorization",
@@ -184,11 +396,12 @@ impl Completer for OpenAiCompleter {
             "temperature": request.route.temperature,
             "max_tokens": request.route.max_output_tokens,
         });
-        if self.cfg.json_mode {
+        if self.runtime.cfg.json_mode {
             body["response_format"] = json!({"type": "json_object"});
         }
+        merge_extra_body(&mut body, &self.runtime.cfg.extra_body);
 
-        let value = post_json(&self.name, &self.client, &url, headers, &[], &body).await?;
+        let value = post_json(&self.runtime, &self.client, &url, headers, &[], &body).await?;
         let text = value
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -197,13 +410,13 @@ impl Completer for OpenAiCompleter {
         if text.is_empty() {
             bail!(
                 "{} 返回空内容: {}",
-                self.name,
+                self.runtime.name,
                 truncate(&value.to_string(), 500)
             );
         }
         Ok(LlmResponse {
             text,
-            provider: self.name.clone(),
+            provider: self.runtime.name.clone(),
             model: request.route.model.clone(),
             prompt_tokens: int_at(&value, "/usage/prompt_tokens"),
             completion_tokens: int_at(&value, "/usage/completion_tokens"),
@@ -213,18 +426,14 @@ impl Completer for OpenAiCompleter {
 }
 
 pub struct AnthropicCompleter {
-    name: String,
-    cfg: ProviderConfig,
+    runtime: ProviderRuntime,
     client: Client,
 }
 
 impl AnthropicCompleter {
-    fn new(name: &str, cfg: ProviderConfig) -> Result<Self> {
-        Ok(Self {
-            name: name.to_string(),
-            client: build_client(&cfg)?,
-            cfg,
-        })
+    fn new(runtime: ProviderRuntime) -> Result<Self> {
+        let client = build_client(&runtime.cfg)?;
+        Ok(Self { runtime, client })
     }
 }
 
@@ -234,37 +443,41 @@ impl Completer for AnthropicCompleter {
         if request.api_key.is_empty() {
             bail!(
                 "缺少 {} 的 API Key（环境变量 {}）",
-                self.name,
-                self.cfg.api_key_env
+                self.runtime.name,
+                self.runtime.cfg.api_key_env
             );
         }
-        let base = if self.cfg.base_url.is_empty() {
+        let base = if self.runtime.cfg.base_url.is_empty() {
             "https://api.anthropic.com"
         } else {
-            &self.cfg.base_url
+            self.runtime.cfg.base_url.as_str()
         };
         let url = format!("{}/v1/messages", base.trim_end_matches('/'));
-        let mut headers = base_headers(&self.cfg);
+        let mut headers = base_headers(&self.runtime.cfg);
         insert_header(&mut headers, "x-api-key", &request.api_key);
-        insert_header(&mut headers, "anthropic-version", &self.cfg.api_version);
+        insert_header(
+            &mut headers,
+            "anthropic-version",
+            &self.runtime.cfg.api_version,
+        );
         insert_header(&mut headers, "content-type", "application/json");
 
         let mut system_block = json!({"type": "text", "text": request.system});
         if request.cache_system {
             system_block["cache_control"] = json!({"type": "ephemeral"});
         }
-        let body = json!({
+        let mut body = json!({
             "model": request.route.model,
             "system": [system_block],
             "messages": [{"role": "user", "content": request.user}],
             "temperature": request.route.temperature,
             "max_tokens": request.route.max_output_tokens,
         });
+        merge_extra_body(&mut body, &self.runtime.cfg.extra_body);
 
-        let value = post_json(&self.name, &self.client, &url, headers, &[], &body).await?;
-        let text = value
-            .get("content")
-            .and_then(Value::as_array)
+        let value = post_json(&self.runtime, &self.client, &url, headers, &[], &body).await?;
+        let blocks = value.get("content").and_then(Value::as_array);
+        let text = blocks
             .map(|blocks| {
                 blocks
                     .iter()
@@ -274,15 +487,30 @@ impl Completer for AnthropicCompleter {
             })
             .unwrap_or_default();
         if text.is_empty() {
+            let has_thinking = blocks
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+                })
+                .unwrap_or(false);
+            if has_thinking {
+                bail!(
+                    "{} 只返回 thinking 块、没有正文（thinking 可能占满了 max_tokens={}）：\
+                     可用 providers.*.extra_body 关闭 thinking，或提高该路由的 max_output_tokens",
+                    self.runtime.name,
+                    request.route.max_output_tokens
+                );
+            }
             bail!(
                 "{} 返回空内容: {}",
-                self.name,
+                self.runtime.name,
                 truncate(&value.to_string(), 500)
             );
         }
         Ok(LlmResponse {
             text,
-            provider: self.name.clone(),
+            provider: self.runtime.name.clone(),
             model: request.route.model.clone(),
             prompt_tokens: int_at(&value, "/usage/input_tokens"),
             completion_tokens: int_at(&value, "/usage/output_tokens"),
@@ -292,18 +520,14 @@ impl Completer for AnthropicCompleter {
 }
 
 pub struct GeminiCompleter {
-    name: String,
-    cfg: ProviderConfig,
+    runtime: ProviderRuntime,
     client: Client,
 }
 
 impl GeminiCompleter {
-    fn new(name: &str, cfg: ProviderConfig) -> Result<Self> {
-        Ok(Self {
-            name: name.to_string(),
-            client: build_client(&cfg)?,
-            cfg,
-        })
+    fn new(runtime: ProviderRuntime) -> Result<Self> {
+        let client = build_client(&runtime.cfg)?;
+        Ok(Self { runtime, client })
     }
 }
 
@@ -313,14 +537,14 @@ impl Completer for GeminiCompleter {
         if request.api_key.is_empty() {
             bail!(
                 "缺少 {} 的 API Key（环境变量 {}）",
-                self.name,
-                self.cfg.api_key_env
+                self.runtime.name,
+                self.runtime.cfg.api_key_env
             );
         }
-        let base = if self.cfg.base_url.is_empty() {
+        let base = if self.runtime.cfg.base_url.is_empty() {
             "https://generativelanguage.googleapis.com/v1beta"
         } else {
-            &self.cfg.base_url
+            self.runtime.cfg.base_url.as_str()
         };
         let url = format!(
             "{}/models/{}:generateContent",
@@ -339,10 +563,10 @@ impl Completer for GeminiCompleter {
         let query = vec![("key".to_string(), request.api_key.clone())];
 
         let value = post_json(
-            &self.name,
+            &self.runtime,
             &self.client,
             &url,
-            base_headers(&self.cfg),
+            base_headers(&self.runtime.cfg),
             &query,
             &body,
         )
@@ -360,13 +584,13 @@ impl Completer for GeminiCompleter {
         if text.is_empty() {
             bail!(
                 "{} 返回空内容: {}",
-                self.name,
+                self.runtime.name,
                 truncate(&value.to_string(), 500)
             );
         }
         Ok(LlmResponse {
             text,
-            provider: self.name.clone(),
+            provider: self.runtime.name.clone(),
             model: request.route.model.clone(),
             prompt_tokens: int_at(&value, "/usageMetadata/promptTokenCount"),
             completion_tokens: int_at(&value, "/usageMetadata/candidatesTokenCount"),
@@ -446,21 +670,51 @@ pub struct LlmService {
     settings: Arc<Settings>,
     store: Arc<StateStore>,
     completers: HashMap<String, Arc<dyn Completer>>,
+    governor: Arc<AdaptiveSemaphore>,
+    billing_checked: AtomicBool,
 }
 
 impl LlmService {
     pub fn new(settings: Arc<Settings>, store: Arc<StateStore>) -> Result<Self> {
+        let concurrency = &settings.concurrency;
+        let governor = AdaptiveSemaphore::new(
+            concurrency.chapter_workers,
+            concurrency.min_chapter_workers,
+            concurrency.max_chapter_workers,
+            concurrency.adaptive,
+            concurrency.recover_after_successes,
+        );
+
+        let mut breakers: HashMap<String, Arc<Mutex<BreakerState>>> = HashMap::new();
         let mut completers: HashMap<String, Arc<dyn Completer>> = HashMap::new();
         for (name, cfg) in &settings.providers {
-            completers.insert(name.clone(), build_completer(name, cfg)?);
+            let group = if cfg.breaker_group.is_empty() {
+                name.clone()
+            } else {
+                cfg.breaker_group.clone()
+            };
+            let breaker = breakers
+                .entry(group)
+                .or_insert_with(|| Arc::new(Mutex::new(BreakerState::default())))
+                .clone();
+            let runtime = ProviderRuntime {
+                name: name.clone(),
+                cfg: cfg.clone(),
+                breaker,
+                governor: governor.clone(),
+            };
+            completers.insert(name.clone(), build_completer(runtime)?);
         }
         completers
             .entry("mock".into())
             .or_insert_with(|| Arc::new(MockCompleter));
+
         Ok(Self {
             settings,
             store,
             completers,
+            governor,
+            billing_checked: AtomicBool::new(false),
         })
     }
 
@@ -474,6 +728,10 @@ impl LlmService {
         let mut service = Self::new(settings, store)?;
         service.completers.insert(provider.to_string(), completer);
         Ok(service)
+    }
+
+    pub fn governor(&self) -> Arc<AdaptiveSemaphore> {
+        self.governor.clone()
     }
 
     fn resolve(&self, route_name: RouteName) -> Result<(&RouteConfig, Arc<dyn Completer>, String)> {
@@ -513,6 +771,105 @@ impl LlmService {
         Ok(())
     }
 
+    /// 长跑前查可用余额；余额不足直接抛 BillingError。
+    pub async fn preflight_billing(&self) -> Result<()> {
+        if self.billing_checked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let used: HashSet<&str> = RouteName::ALL
+            .iter()
+            .map(|route| self.settings.models.get(*route).provider.as_str())
+            .collect();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("创建余额预检客户端失败")?;
+
+        for (name, cfg) in &self.settings.providers {
+            if !used.contains(name.as_str())
+                || cfg.provider_type == "mock"
+                || cfg.balance_url.is_empty()
+            {
+                continue;
+            }
+            let api_key = self.settings.api_key(name)?;
+            if api_key.is_empty() {
+                continue;
+            }
+            let mut headers = base_headers(cfg);
+            insert_header(&mut headers, "authorization", &format!("Bearer {api_key}"));
+            let response = match client.get(&cfg.balance_url).headers(headers).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!("{name} 余额预检失败（忽略）: {error}");
+                    continue;
+                }
+            };
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                warn!(
+                    "{name} 余额预检返回 {}（忽略）: {}",
+                    status.as_u16(),
+                    truncate(&text, 200)
+                );
+                continue;
+            }
+            let data: Value = match serde_json::from_str(&text) {
+                Ok(data) => data,
+                Err(_) => {
+                    warn!("{name} 余额预检返回非 JSON（忽略）");
+                    continue;
+                }
+            };
+            let infos = data
+                .get("balance_infos")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let info = infos
+                .iter()
+                .find(|item| {
+                    item.get("currency").and_then(Value::as_str)
+                        == Some(cfg.balance_currency.as_str())
+                })
+                .or_else(|| infos.first());
+            let Some(info) = info else {
+                warn!("{name} 余额预检没有 balance_infos（忽略）");
+                continue;
+            };
+            let total = info
+                .get("total_balance")
+                .and_then(|value| {
+                    value
+                        .as_f64()
+                        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            let currency = info
+                .get("currency")
+                .and_then(Value::as_str)
+                .unwrap_or(&cfg.balance_currency);
+            let available = data
+                .get("is_available")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            info!(
+                "{name} 余额预检：{currency} {total:.2}（阈值 {:.2}）",
+                cfg.balance_min
+            );
+            if !available || total <= cfg.balance_min {
+                return Err(BillingError(format!(
+                    "{name} 余额不足：{currency} {total:.2}（阈值 {:.2}），请充值后再跑",
+                    cfg.balance_min
+                ))
+                .into());
+            }
+        }
+        self.billing_checked.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub async fn structured<T>(
         &self,
         route_name: RouteName,
@@ -548,7 +905,7 @@ impl LlmService {
             let response = completer
                 .complete(&request)
                 .await
-                .with_context(|| format!("{stage} 阶段调用模型失败"))?;
+                .map_err(|error| error.context(format!("{stage} 阶段调用模型失败")))?;
             self.record_cost(&route, &response, stage, segment_id);
 
             match parse_and_validate::<T>(&response.text) {
@@ -607,11 +964,13 @@ impl LlmService {
     }
 }
 
-fn build_completer(name: &str, cfg: &ProviderConfig) -> Result<Arc<dyn Completer>> {
-    match cfg.provider_type.as_str() {
-        "openai" => Ok(Arc::new(OpenAiCompleter::new(name, cfg.clone())?)),
-        "anthropic" => Ok(Arc::new(AnthropicCompleter::new(name, cfg.clone())?)),
-        "gemini" => Ok(Arc::new(GeminiCompleter::new(name, cfg.clone())?)),
+fn build_completer(runtime: ProviderRuntime) -> Result<Arc<dyn Completer>> {
+    let provider_type = runtime.cfg.provider_type.clone();
+    let name = runtime.name.clone();
+    match provider_type.as_str() {
+        "openai" => Ok(Arc::new(OpenAiCompleter::new(runtime)?)),
+        "anthropic" => Ok(Arc::new(AnthropicCompleter::new(runtime)?)),
+        "gemini" => Ok(Arc::new(GeminiCompleter::new(runtime)?)),
         "mock" => Ok(Arc::new(MockCompleter)),
         other => bail!("未知 provider 类型: {other:?}（provider={name}）"),
     }

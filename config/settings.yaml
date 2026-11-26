@@ -20,7 +20,12 @@ paths:
 
 concurrency:
   # 章间并发；章内严格顺序滑动，保证前文译文可用
-  chapter_workers: 8
+  chapter_workers: 3
+  # 自适应并发：429/529/503 时下调，连续成功 recover_after_successes 次后上调
+  adaptive: true
+  min_chapter_workers: 1
+  max_chapter_workers: 6
+  recover_after_successes: 30
   # 始终挂载的核心角色数量（按全书提及频次排序）
   core_characters: 10
   # 全书扫描的输入预算（字符），超出后按章均匀抽样，避免请求体爆炸
@@ -40,23 +45,23 @@ qa:
 
 models:
   bible:
-    provider: gemini
-    model: gemini-3-pro
+    provider: deepseek
+    model: deepseek-flash
     temperature: 0.2
     max_output_tokens: 32768
   pass1:
-    provider: deepseek
-    model: deepseek-v4
+    provider: glm_flash
+    model: glm-5.3-flash
     temperature: 0.1
     max_output_tokens: 8192
   pass2:
-    provider: anthropic
-    model: claude-sonnet-4-5
+    provider: deepseek
+    model: deepseek-flash
     temperature: 0.7
     max_output_tokens: 8192
   judge:
-    provider: openai
-    model: gpt-4o-mini
+    provider: glm
+    model: glm-5.4
     temperature: 0.0
     max_output_tokens: 4096
 
@@ -71,6 +76,10 @@ providers:
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     timeout_seconds: 180
+    # 长跑前余额预检；低于阈值直接中止，避免 402 把段落标成人工
+    balance_url: https://api.deepseek.com/user/balance
+    balance_currency: CNY
+    balance_min: 0.5
   anthropic:
     type: anthropic
     base_url: https://api.anthropic.com
@@ -82,12 +91,58 @@ providers:
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
     timeout_seconds: 120
+  # 智谱 GLM Coding Plan（Anthropic 兼容协议；也可换 openai 类型 + /api/coding/paas/v4）
+  glm:
+    type: anthropic
+    base_url: https://open.bigmodel.cn/api/anthropic
+    api_key_env: GLM_API_KEY
+    api_version: "2023-06-01"
+    timeout_seconds: 300
+    # 连续失败熔断：失败达到阈值后暂停 GLM 组的所有请求，冷却完自动续跑
+    breaker_failure_threshold: 4
+    breaker_cooldown_seconds: 300
+    breaker_max_rounds: 3
+    breaker_group: glm
+  # pass2 专用：关闭 thinking，避免思考块吃光 max_output_tokens 导致无正文
+  glm_flash:
+    type: anthropic
+    base_url: https://open.bigmodel.cn/api/anthropic
+    api_key_env: GLM_API_KEY
+    api_version: "2023-06-01"
+    timeout_seconds: 180
+    breaker_failure_threshold: 4
+    breaker_cooldown_seconds: 300
+    breaker_max_rounds: 3
+    breaker_group: glm
+    extra_body:
+      thinking:
+        type: disabled
   # bookcraft --mock 时所有路由指向该 provider，用于无密钥跑通全链路
   mock:
     type: mock
 
 # 单价 USD / 百万 token，用于成本台账；用 provider/model 作为键
 pricing:
+  # GLM-5.3-Flash 官方价（¥0.8 / ¥2.8 每百万，按 $0.15 / $0.50 折算）
+  glm/glm-5.3-flash:
+    input_per_mtok: 0.15
+    output_per_mtok: 0.50
+    cached_input_per_mtok: 0.03
+  glm_flash/glm-5.3-flash:
+    input_per_mtok: 0.15
+    output_per_mtok: 0.50
+    cached_input_per_mtok: 0.03
+  # GLM-5.4 目前只在 Coding Plan 订阅内提供，官方未公布 token 单价；
+  # 此处按 GLM-5.3 基线估算，仅用于台账相对比较
+  glm/glm-5.4:
+    input_per_mtok: 1.40
+    output_per_mtok: 4.40
+    cached_input_per_mtok: 0.26
+  # DeepSeek 官方峰谷计价：此处按峰值价记录（成本上界），off-peak 为半价
+  deepseek/deepseek-flash:
+    input_per_mtok: 0.30
+    output_per_mtok: 1.20
+    cached_input_per_mtok: 0.006
   deepseek/deepseek-v4:
     input_per_mtok: 0.28
     output_per_mtok: 0.42

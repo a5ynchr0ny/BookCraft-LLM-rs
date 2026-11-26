@@ -13,6 +13,7 @@ use zip::ZipArchive;
 
 use crate::config::Settings;
 use crate::epub_io::{find_entry, write_epub_copy};
+use crate::export_validate::{ExportValidationError, validate_epub, validate_segments};
 use crate::html::{
     append_child, create_element, create_text, find_elements, find_first_element, get_attribute,
     parse_document_html, parse_fragment_html, replace_children, serialize_document, set_attribute,
@@ -56,6 +57,20 @@ impl EpubBuilder {
             flat_segments.extend(segments.clone());
             segments_by_chapter.insert(chapter.id.clone(), segments);
         }
+        let problems = validate_segments(&flat_segments);
+        if !problems.is_empty() {
+            let detail = problems
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(ExportValidationError(format!(
+                "导出前硬校验失败（{} 项，前 20 项）：\n{detail}",
+                problems.len()
+            ))
+            .into());
+        }
         let missing = flat_segments
             .iter()
             .filter(|segment| {
@@ -89,6 +104,20 @@ impl EpubBuilder {
             &meta.target_lang,
             false,
         )?;
+        let problems = validate_epub(&zh_epub);
+        if !problems.is_empty() {
+            return Err(ExportValidationError(format!(
+                "中文 EPUB 校验失败（{} 项）：\n{}",
+                problems.len(),
+                problems
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+            .into());
+        }
         self.build_epub(
             &source,
             &chapters,
@@ -98,6 +127,20 @@ impl EpubBuilder {
             &meta.target_lang,
             true,
         )?;
+        let problems = validate_epub(&bilingual_epub);
+        if !problems.is_empty() {
+            return Err(ExportValidationError(format!(
+                "双语 EPUB 校验失败（{} 项）：\n{}",
+                problems.len(),
+                problems
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+            .into());
+        }
         self.write_markdown(&meta, &chapters, &segments_by_chapter, &zh_md, false)?;
         self.write_markdown(&meta, &chapters, &segments_by_chapter, &bilingual_md, true)?;
         self.write_qa_report(&meta, &qa_report, missing)?;

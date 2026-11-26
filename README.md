@@ -121,13 +121,14 @@ Key 有两种填法（任选其一，shell 环境变量优先）：
 ```bash
 # 方式 A：项目根目录 .env（推荐，已加入 .gitignore）
 cp .env.example .env
-# 编辑 .env，填入 GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY
+# 编辑 .env，填入 GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY / GLM_API_KEY
 
 # 方式 B：直接 export
 export GEMINI_API_KEY=...
 export ANTHROPIC_API_KEY=...
 export OPENAI_API_KEY=...
 export DEEPSEEK_API_KEY=...
+export GLM_API_KEY=...
 ```
 
 启动时自动加载 `.env`，但**不会覆盖** shell 中已存在的同名变量。变量名由 `config/settings.yaml` 中 `providers.*.api_key_env` 决定。
@@ -168,6 +169,8 @@ bookcraft run book.epub
 | `run [epub]` | prepare → bible → translate → export |
 
 全局参数：`--config`、`--workdir`、`--mock`、`-v`。
+
+> 计费/额度不足时进程以 **退出码 3** 结束，并保留最近检查点；不会把段落标成 `HUMAN_REVIEW`。
 
 ## 核心设计细节
 
@@ -228,10 +231,17 @@ PENDING → DRAFTED → POLISHED → QA_PASSED
 - Prompt 静态前缀前置以命中缓存（Anthropic 系统块已带 `cache_control: ephemeral`）；
 - `pricing` 按 `provider/model` 配置 USD / 百万 token，支持缓存输入单价；mock 模式成本为 0。
 
+### 6.5 运行保护
+
+- **欠费/额度预检**：`providers.*.balance_url` 指定余额接口（DeepSeek 已配 `/user/balance`），长跑前检查 `balance_min`；HTTP 402 或 `insufficient_quota` / `余额不足` 等错误直接抛 `BillingError`，CLI 以**退出码 3**中止，保留最近检查点，不把段落标成 `HUMAN_REVIEW`。
+- **限流自适应**：`concurrency.adaptive=true` 时，遇到 429/529/503 下调章节并发，连续 `recover_after_successes` 次成功后再逐级回升；provider 级连续失败熔断（`breaker_*`）会把整组请求暂停冷却。
+- **provider 私有参数**：`providers.*.extra_body` 原样并入请求体，例如 GLM 的 `thinking: {type: disabled}`，避免思考块吃光 `max_output_tokens`。
+- **导出硬校验**：导出前检查每段终稿与占位符完整性；导出后检查 EPUB 的 mimetype、manifest、spine、NCX、相对链接和残留 `[tag_`。任一项失败即拒绝导出并列出问题。
+
 ## 测试与质量
 
 ```bash
-cargo test                     # 35 个测试
+cargo test                     # 51 个测试
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -242,6 +252,7 @@ cargo fmt --check
 - 实体匹配：大小写、词边界、连字符复合词、最长匹配、频次排序、空圣经；
 - QA Level 1：标签错误、漏译、膨胀、黑名单、首现、短段豁免；
 - 反思循环：只重跑 Pass 2、回退 Pass 1、重试耗尽转人工、已通过段落不重复处理；
+- 运行保护：计费错误检测与 Judge 传播、计费中止不降级 HUMAN_REVIEW、自适应并发升降、导出硬校验；
 - 端到端：`prepare → bible → translate(--limit) → 续跑 → export`，校验产物 XML 合法、无残留占位符、`<i>/<sup>/<a>` 保留、双语样式与 OPF 元数据正确。
 
 ## 已知限制 / Roadmap
@@ -249,9 +260,9 @@ cargo fmt --check
 - `settings.yaml` 的模型 ID 是占位值；不同供应商的参数差异需按实际 API 调整；
 - Prompt 目前针对**法语文学 → 中文**调校，其他语向需要改写风格指南与长度比阈值；
 - 超长书的《翻译圣经》采用「按章预算首尾抽样」控制输入；可扩展为 map-reduce 分卷抽取再归并；
-- 导出目前总是整本；未实现单章导出与「强制重译已通过章节」的参数；
+- 导出前会硬校验每段终稿与占位符；存在未翻译段落时直接拒绝导出（不再回退原文）。导出仍是整本，未实现单章导出与「强制重译已通过章节」的参数；
 - 导航页（nav.xhtml / NCX）不翻译，目录标题保持原文；每章首个标题会作为正文翻译；
-- 暂未实现：限流令牌桶、全局预算硬熔断、Web UI、图片内文字 OCR；
+- 暂未实现：全局预算硬熔断、Web UI、图片内文字 OCR；
 - 请仅对**公版或已获授权**的文本使用本项目。
 
 ## License

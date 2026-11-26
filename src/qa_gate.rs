@@ -130,8 +130,9 @@ impl QAGate {
 
         for character in &mentioned.characters {
             let key = format!("char:{}", character.canonical_id);
+            let masked = mask_allowed_targets(translation, &character.all_allowed_targets());
             for variant in &character.forbidden_variants {
-                if contains_text(translation, variant) {
+                if contains_text(&masked, variant) {
                     issues.push(QaIssue {
                         issue_type: IssueType::GlossaryDrift,
                         source_span: character.source_name.clone(),
@@ -165,8 +166,9 @@ impl QAGate {
 
         for entry in &mentioned.glossary {
             let key = format!("gloss:{}", entry.source_term);
+            let masked = mask_allowed_targets(translation, &entry.all_allowed_targets());
             for variant in &entry.forbidden_variants {
-                if contains_text(translation, variant) {
+                if contains_text(&masked, variant) {
                     issues.push(QaIssue {
                         issue_type: IssueType::GlossaryDrift,
                         source_span: entry.source_term.clone(),
@@ -264,18 +266,18 @@ impl QAGate {
         prompt_entities: &MatchedEntities,
         first_keys: &HashSet<String>,
         prev_translations: &[String],
-    ) -> QaResult {
+    ) -> Result<QaResult> {
         let (level1_passed, issues, routing) =
             self.check_deterministic(segment, translation, mentioned, first_keys);
         if !level1_passed {
-            return QaResult {
+            return Ok(QaResult {
                 passed: false,
                 level1_passed: false,
                 score: None,
                 routing,
                 issues,
                 judge_skipped_reason: None,
-            };
+            });
         }
 
         let user = match self.prompts.render(
@@ -290,18 +292,18 @@ impl QAGate {
             Ok(user) => user,
             Err(error) => {
                 warn!("[{}] 渲染 Judge Prompt 失败: {error:#}", segment.id);
-                return QaResult {
+                return Ok(QaResult {
                     passed: true,
                     level1_passed: true,
                     score: None,
                     routing: ErrorRouting::None,
                     issues: Vec::new(),
                     judge_skipped_reason: Some(format!("prompt render: {error:#}")),
-                };
+                });
             }
         };
 
-        let verdict_result = llm
+        let verdict = match llm
             .structured::<JudgeVerdict>(
                 crate::config::RouteName::Judge,
                 &self.judge_system,
@@ -310,20 +312,23 @@ impl QAGate {
                 json!({"source_text": segment.source_text, "candidate": translation}),
                 Some(&segment.id),
             )
-            .await;
-
-        let verdict = match verdict_result {
+            .await
+        {
             Ok(verdict) => verdict,
             Err(error) => {
+                // 欠费/额度耗尽必须向上传播，绝不能 fail-open 成 QA_PASSED
+                if crate::llm::error_is_billing(&error) {
+                    return Err(error);
+                }
                 warn!("[{}] Judge 不可用，fail-open 放行: {error:#}", segment.id);
-                return QaResult {
+                return Ok(QaResult {
                     passed: true,
                     level1_passed: true,
                     score: None,
                     routing: ErrorRouting::None,
                     issues: Vec::new(),
                     judge_skipped_reason: Some(format!("{error:#}")),
-                };
+                });
             }
         };
 
@@ -342,14 +347,14 @@ impl QAGate {
             };
         }
 
-        QaResult {
+        Ok(QaResult {
             passed,
             level1_passed: true,
             score: Some(verdict.score as f64),
             routing: final_routing,
             issues: verdict.issues,
             judge_skipped_reason: None,
-        }
+        })
     }
 }
 
@@ -376,6 +381,52 @@ pub fn derive_routing(issues: &[QaIssue]) -> ErrorRouting {
         return ErrorRouting::RerunPass2Only;
     }
     ErrorRouting::None
+}
+
+fn mask_allowed_targets(text: &str, allowed_targets: &[String]) -> String {
+    // 标准译名可能包含禁用变体作为子串（如「阿弗尔」之于「勒阿弗尔」），
+    // 先遮掉允许译名，再检查剩余文本里是否真有禁用变体。
+    let mut seen = HashSet::new();
+    let mut targets: Vec<&String> = allowed_targets
+        .iter()
+        .filter(|target| !target.is_empty() && seen.insert(target.as_str()))
+        .collect();
+    targets.sort_by_key(|target| std::cmp::Reverse(target.chars().count()));
+
+    let mut masked = text.to_string();
+    for target in targets {
+        if target.is_ascii() {
+            masked = replace_ascii_case_insensitive(&masked, target, "\u{3000}");
+        } else {
+            masked = masked.replace(target.as_str(), "\u{3000}");
+        }
+    }
+    masked
+}
+
+fn replace_ascii_case_insensitive(text: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return text.to_string();
+    }
+    let needle_bytes = needle.as_bytes();
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < text.len() {
+        let end = index + needle_bytes.len();
+        if end <= text.len()
+            && bytes[index..end].eq_ignore_ascii_case(needle_bytes)
+            && text.is_char_boundary(end)
+        {
+            out.push_str(replacement);
+            index = end;
+            continue;
+        }
+        let ch = text[index..].chars().next().expect("char boundary");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
 }
 
 fn contains_text(haystack: &str, needle: &str) -> bool {

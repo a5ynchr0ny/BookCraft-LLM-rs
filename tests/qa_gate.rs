@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bookcraft::config::Settings;
 use bookcraft::entity_matcher::MatchedEntities;
-use bookcraft::models::{Character, ErrorRouting};
+use bookcraft::models::{Character, ErrorRouting, GlossaryEntry};
 use bookcraft::prompts::PromptLibrary;
 use bookcraft::qa_gate::QAGate;
 use bookcraft::state::SegmentRecord;
@@ -218,4 +218,85 @@ fn empty_translation_is_omission() {
     );
     assert!(!passed);
     assert_eq!(routing, ErrorRouting::RerunFromPass1);
+}
+
+fn le_havre_character(forbidden: &[&str]) -> Character {
+    Character {
+        canonical_id: "char_havre".into(),
+        source_name: "Le Havre".into(),
+        aliases: Vec::new(),
+        target_name: "勒阿弗尔".into(),
+        short_target_map: BTreeMap::new(),
+        forbidden_variants: forbidden.iter().map(|value| value.to_string()).collect(),
+        identity_and_arc: String::new(),
+        voice_profile: String::new(),
+        pronoun_matrix: Vec::new(),
+    }
+}
+
+fn le_havre_segment() -> SegmentRecord {
+    let mut segment = segment();
+    segment.source_text = "Il alla au Havre.".into();
+    segment.source_words = 5;
+    segment.tag_map = HashMap::new();
+    segment
+}
+
+#[test]
+fn forbidden_variant_inside_standard_name_not_flagged() {
+    let mentioned = MatchedEntities {
+        characters: vec![le_havre_character(&["阿弗尔", "勒阿弗"])],
+        glossary: Vec::new(),
+    };
+    let (passed, issues, _) = check(
+        &le_havre_segment(),
+        "勒阿弗尔治安法庭，第三区。",
+        &mentioned,
+        &HashSet::new(),
+    );
+    assert!(passed, "{issues:?}");
+}
+
+#[test]
+fn forbidden_variant_outside_standard_name_still_flagged() {
+    let mentioned = MatchedEntities {
+        characters: vec![le_havre_character(&["阿弗尔"])],
+        glossary: Vec::new(),
+    };
+    let (passed, issues, _) = check(
+        &le_havre_segment(),
+        "阿弗尔治安法庭。",
+        &mentioned,
+        &HashSet::new(),
+    );
+    assert!(!passed);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.issue_type.as_str() == "GLOSSARY_DRIFT")
+    );
+}
+
+#[test]
+fn glossary_variant_inside_standard_name_not_flagged() {
+    let entry = GlossaryEntry {
+        id: "g1".into(),
+        source_term: "Le Havre".into(),
+        aliases: Vec::new(),
+        target_term: "勒阿弗尔".into(),
+        forbidden_variants: vec!["阿弗尔".into()],
+        category: "LOCATION".into(),
+        context_note: String::new(),
+    };
+    let mentioned = MatchedEntities {
+        characters: Vec::new(),
+        glossary: vec![entry],
+    };
+    let (passed, issues, _) = check(
+        &le_havre_segment(),
+        "勒阿弗尔治安法庭，第三区。",
+        &mentioned,
+        &HashSet::new(),
+    );
+    assert!(passed, "{issues:?}");
 }

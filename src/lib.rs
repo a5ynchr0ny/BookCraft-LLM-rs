@@ -1,9 +1,11 @@
 pub mod bible_builder;
+pub mod concurrency;
 pub mod config;
 pub mod entity_matcher;
 pub mod epub_builder;
 pub mod epub_io;
 pub mod epub_parser;
+pub mod export_validate;
 pub mod html;
 pub mod llm;
 pub mod models;

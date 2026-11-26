@@ -119,6 +119,12 @@ fn resume_limit_and_idempotency() {
     assert!(first.status.success(), "{first:?}");
     assert_eq!(passed_count(&workdir), 3);
 
+    let partial_export = run_cli(&workdir, &["export"]);
+    assert!(
+        !partial_export.status.success(),
+        "partial export must be rejected by hard validation"
+    );
+
     let rest = run_cli(&workdir, &["--mock", "translate"]);
     assert!(rest.status.success(), "{rest:?}");
     assert_eq!(passed_count(&workdir), 9);

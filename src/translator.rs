@@ -2,16 +2,17 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
-use futures::stream::{self, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
 use tracing::{error, info, warn};
 
+use crate::concurrency::AdaptiveSemaphore;
 use crate::config::{RouteName, Settings};
 use crate::entity_matcher::{EntityMatcher, MatchedEntities};
-use crate::llm::LlmService;
+use crate::llm::{LlmService, error_is_billing};
 use crate::models::{
     Character, ErrorRouting, Pass1Result, Pass2Result, SegmentState, TranslationBible,
 };
@@ -31,6 +32,7 @@ pub struct TranslationOptions {
 struct RunState {
     slots: AtomicUsize,
     limit: Option<usize>,
+    halt: AtomicBool,
 }
 
 impl RunState {
@@ -50,6 +52,7 @@ pub struct TranslationEngine {
     prompts: Arc<PromptLibrary>,
     matcher: EntityMatcher,
     qa: QAGate,
+    governor: Arc<AdaptiveSemaphore>,
     pass1_system: String,
     pass2_system: String,
 }
@@ -64,6 +67,7 @@ impl TranslationEngine {
     ) -> Result<Self> {
         let matcher = EntityMatcher::new(&bible);
         let qa = QAGate::new(settings.clone(), prompts.clone())?;
+        let governor = llm.governor();
         let pass1_system = prompts.render("pass1_system.j2", json!({}))?;
         let pass2_system = prompts.render(
             "pass2_system.j2",
@@ -76,6 +80,7 @@ impl TranslationEngine {
             prompts,
             matcher,
             qa,
+            governor,
             pass1_system,
             pass2_system,
         })
@@ -118,36 +123,53 @@ impl TranslationEngine {
 
         let stats_before = self.store.stats()?;
         info!(
-            "开始翻译：{} 章 / {} 段（当前已通过 {} 段，预计启动 {} 个章节 Worker）",
+            "开始翻译：{} 章 / {} 段（当前已通过 {} 段，章节并发 {}，{}）",
             chapters.len(),
             all_segments.len(),
             stats_before.states.get("QA_PASSED").copied().unwrap_or(0),
-            self.settings.concurrency.chapter_workers
+            self.governor.limit(),
+            if self.governor.is_adaptive() {
+                "自适应"
+            } else {
+                "固定"
+            }
         );
 
         let state = Arc::new(RunState {
             slots: AtomicUsize::new(0),
             limit: options.limit,
+            halt: AtomicBool::new(false),
         });
         let retry_human = options.retry_human;
-        let workers = self.settings.concurrency.chapter_workers.max(1);
 
-        let futures = chapters.into_iter().map(|chapter| {
+        let mut tasks = FuturesUnordered::new();
+        for chapter in chapters {
             let state = state.clone();
             let core = core_characters.clone();
-            async move {
+            let governor = self.governor.clone();
+            tasks.push(async move {
+                let _permit = governor.acquire().await;
                 let chapter_id = chapter.id.clone();
                 let result = self.run_chapter(&chapter, &core, retry_human, &state).await;
-                if let Err(error) = &result {
+                (chapter_id, result)
+            });
+        }
+        let mut billing_error: Option<anyhow::Error> = None;
+        while let Some((chapter_id, result)) = tasks.next().await {
+            if let Err(error) = result {
+                if error_is_billing(&error) {
+                    state.halt.store(true, Ordering::SeqCst);
+                    if billing_error.is_none() {
+                        billing_error = Some(error);
+                    }
+                } else {
                     error!("章节 {chapter_id} 意外失败: {error:#}");
                 }
-                result
             }
-        });
-        let _: Vec<Result<()>> = stream::iter(futures)
-            .buffer_unordered(workers)
-            .collect()
-            .await;
+        }
+        if let Some(error) = billing_error {
+            return Err(error);
+        }
 
         let stats = self.store.stats()?;
         info!(
@@ -197,6 +219,10 @@ impl TranslationEngine {
         let mut skipped = 0usize;
 
         for (index, segment) in segments.iter().enumerate() {
+            if state.halt.load(Ordering::Relaxed) {
+                warn!("计费/额度保护已触发，章节 {} 提前停止", chapter.id);
+                return Ok(());
+            }
             if segment.state == SegmentState::QaPassed {
                 skipped += 1;
                 push_context(
@@ -246,8 +272,9 @@ impl TranslationEngine {
                     mentioned,
                     &prompt_entities,
                     first_keys,
+                    state,
                 )
-                .await;
+                .await?;
             match &text {
                 Some(text) => push_context(&mut prev_texts, text),
                 None => push_context(&mut prev_texts, &segment.source_text),
@@ -275,7 +302,8 @@ impl TranslationEngine {
         mentioned: &MatchedEntities,
         prompt_entities: &MatchedEntities,
         first_keys: &HashSet<String>,
-    ) -> Option<String> {
+        state: &RunState,
+    ) -> Result<Option<String>> {
         let max_attempts = 1 + self.settings.qa.max_retry;
         let mut attempt = segment.retry_count.max(0) as usize;
         if attempt >= max_attempts {
@@ -285,7 +313,7 @@ impl TranslationEngine {
             );
             let text = segment.best_text.clone().or(segment.final_text.clone());
             self.mark_human(segment, "重试次数已耗尽", text.as_deref());
-            return text;
+            return Ok(text);
         }
 
         let mut current = segment.clone();
@@ -348,7 +376,7 @@ impl TranslationEngine {
                         first_keys,
                         prev_texts,
                     )
-                    .await;
+                    .await?;
                 self.store.record_qa(
                     &current.id,
                     attempt as i64,
@@ -437,8 +465,14 @@ impl TranslationEngine {
         .await;
 
         match result {
-            Ok(text) => text,
+            Ok(text) => Ok(text),
             Err(error) => {
+                if error_is_billing(&error) {
+                    // 欠费/额度耗尽：保留最近检查点，停止整轮，不降级为 HUMAN_REVIEW
+                    error!("[{}] 计费/额度错误，停止本轮翻译: {error:#}", segment.id);
+                    state.halt.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
                 error!("[{}] 处理异常，转人工复核: {error:#}", segment.id);
                 let fallback = self
                     .store
@@ -448,7 +482,7 @@ impl TranslationEngine {
                     .and_then(|latest| latest.best_text.or(latest.final_text))
                     .or_else(|| segment.final_text.clone());
                 self.mark_human(segment, &format!("{error:#}"), fallback.as_deref());
-                fallback
+                Ok(fallback)
             }
         }
     }

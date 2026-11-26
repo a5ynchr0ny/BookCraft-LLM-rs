@@ -12,7 +12,7 @@ use bookcraft::bible_builder::BibleBuilder;
 use bookcraft::config::Settings;
 use bookcraft::epub_builder::EpubBuilder;
 use bookcraft::epub_parser::EpubParser;
-use bookcraft::llm::LlmService;
+use bookcraft::llm::{LlmService, error_is_billing};
 use bookcraft::prompts::PromptLibrary;
 use bookcraft::state::{StateStore, Stats};
 use bookcraft::translator::{TranslationEngine, TranslationOptions};
@@ -105,6 +105,10 @@ struct PrepareOptions {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run_cli().await {
+        if error_is_billing(&error) {
+            eprintln!("⛔ 计费/额度保护：{error:#}");
+            std::process::exit(3);
+        }
         eprintln!("{error:#}");
         std::process::exit(1);
     }
@@ -289,6 +293,7 @@ async fn do_bible(
     if store.load_book_meta()?.is_none() {
         bail!("尚未解析书籍，请先运行：bookcraft prepare <book.epub>");
     }
+    llm.preflight_billing().await?;
     let builder = BibleBuilder::new(
         settings.clone(),
         store.clone(),
@@ -326,6 +331,7 @@ async fn do_translate(
     limit: Option<usize>,
     retry_human: bool,
 ) -> Result<()> {
+    llm.preflight_billing().await?;
     let bible = store
         .load_bible()?
         .ok_or_else(|| anyhow::anyhow!("尚未生成《翻译圣经》，请先运行：bookcraft bible"))?;

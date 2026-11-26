@@ -187,3 +187,32 @@ pub fn patch_opf(data: &[u8], title: Option<&str>, language: Option<&str>) -> Ve
 
     text.into_bytes()
 }
+
+/// 把 OPF/NCX/正文里的相对链接解析为 zip 内部路径。
+pub fn resolve_href(base_dir: &str, href: &str) -> String {
+    let decoded = percent_decode_str(href)
+        .decode_utf8_lossy()
+        .replace('\\', "/");
+    let path = decoded.split('#').next().unwrap_or("");
+    if path.is_empty() {
+        return String::new();
+    }
+    let combined = if path.starts_with('/') {
+        path.trim_start_matches('/').to_string()
+    } else if base_dir.is_empty() {
+        path.to_string()
+    } else {
+        format!("{base_dir}/{path}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in combined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}

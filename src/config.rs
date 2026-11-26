@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 pub const DEFAULT_CONFIG_RELATIVE: &str = "config/settings.yaml";
 
@@ -53,6 +54,18 @@ pub struct ProviderConfig {
     pub timeout_seconds: f64,
     pub json_mode: bool,
     pub extra_headers: HashMap<String, String>,
+    /// 原样并入请求体，用于供应商私有参数（如 GLM 的 thinking 开关）。
+    pub extra_body: HashMap<String, Value>,
+    /// 连续失败熔断：达到阈值后暂停该 provider 组的所有请求。
+    pub breaker_failure_threshold: u32,
+    pub breaker_cooldown_seconds: f64,
+    pub breaker_max_rounds: u32,
+    /// 同一 group 的 provider 共享熔断状态。
+    pub breaker_group: String,
+    /// 可选：请求前查询余额（DeepSeek 等支持 /user/balance 的供应商）。
+    pub balance_url: String,
+    pub balance_currency: String,
+    pub balance_min: f64,
 }
 
 impl Default for ProviderConfig {
@@ -65,6 +78,14 @@ impl Default for ProviderConfig {
             timeout_seconds: 180.0,
             json_mode: true,
             extra_headers: HashMap::new(),
+            extra_body: HashMap::new(),
+            breaker_failure_threshold: 4,
+            breaker_cooldown_seconds: 120.0,
+            breaker_max_rounds: 3,
+            breaker_group: String::new(),
+            balance_url: String::new(),
+            balance_currency: "CNY".into(),
+            balance_min: 0.0,
         }
     }
 }
@@ -145,6 +166,10 @@ impl ModelsConfig {
 #[serde(default)]
 pub struct ConcurrencyConfig {
     pub chapter_workers: usize,
+    pub adaptive: bool,
+    pub min_chapter_workers: usize,
+    pub max_chapter_workers: usize,
+    pub recover_after_successes: u32,
     pub core_characters: usize,
     pub bible_max_input_chars: usize,
 }
@@ -153,6 +178,10 @@ impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
             chapter_workers: 8,
+            adaptive: true,
+            min_chapter_workers: 1,
+            max_chapter_workers: 6,
+            recover_after_successes: 30,
             core_characters: 10,
             bible_max_input_chars: 1_200_000,
         }

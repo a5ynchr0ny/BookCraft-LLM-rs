@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use bookcraft::config::Settings;
-use bookcraft::llm::{Completer, CompletionRequest, LlmResponse, LlmService};
+use bookcraft::llm::{
+    BillingError, Completer, CompletionRequest, LlmResponse, LlmService, error_is_billing,
+};
 use bookcraft::models::{SegmentState, TranslationBible};
 use bookcraft::prompts::PromptLibrary;
 use bookcraft::state::{ChapterRecord, SegmentRecord, StateStore};
@@ -388,4 +390,28 @@ async fn resume_skips_passed_segments() {
         store.get_segment("ch_001_s0001").unwrap().unwrap().state,
         SegmentState::QaPassed
     );
+}
+
+struct BillingCompleter;
+
+#[async_trait]
+impl Completer for BillingCompleter {
+    async fn complete(&self, _request: &CompletionRequest) -> Result<LlmResponse> {
+        Err(BillingError("DeepSeek 余额不足".into()).into())
+    }
+}
+
+#[tokio::test]
+async fn billing_error_halts_without_human_review() {
+    let dir = tempfile::tempdir().expect("temp");
+    let settings = settings(dir.path());
+    let store = make_store(dir.path(), 1);
+    let engine = make_engine(settings, store.clone(), Arc::new(BillingCompleter));
+    let error = engine
+        .run(TranslationOptions::default())
+        .await
+        .expect_err("billing error must stop the round");
+    assert!(error_is_billing(&error), "{error:#}");
+    let segment = store.get_segment("ch_001_s0001").unwrap().unwrap();
+    assert_eq!(segment.state, SegmentState::Pending);
 }
